@@ -7,9 +7,9 @@
 
 // --- 配置 ---
 // 矩阵维度
-const int M = 1024;
-const int N = 1024;
-const int K = 1024;
+const int M = 2048;
+const int N = 2048;
+const int K = 2048;
 
 // 是否执行主核计算并验证结果
 const bool VERIFY_RESULT = true;

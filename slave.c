@@ -2,21 +2,17 @@
 #include <simd.h>
 #include <string.h>
 
-#define kTileSize 32
+#define kTileSize 128  // 每次沿 K 维度处理的列数
 
 // 每核 C 分块最大尺寸（单位：行/列）
 #define kMaxTileM 128
 #define kMaxTileN 128
 
 // --- LDM 内存布局 ---
-// 1. 计算缓冲区 (所有核都有): 用于 SIMD 计算，需要双缓冲
-__thread_local float A_compute[2][kMaxTileM * kTileSize] __attribute__((aligned(64)));
-__thread_local float B_compute[2][kTileSize * kMaxTileN] __attribute__((aligned(64)));
+// 1. 计算缓冲区 (所有核都有): 用于 SIMD 计算
+__thread_local float A_panel[kMaxTileM * kTileSize] __attribute__((aligned(64)));
+__thread_local float B_panel[kTileSize * kMaxTileN] __attribute__((aligned(64)));
 __thread_local float C_ldm[kMaxTileM * kMaxTileN] __attribute__((aligned(64)));
-
-// 2. DMA中转缓冲区: 用于暂存从DDR搬来的大块数据，也需要双缓冲
-__thread_local float A_staging[2][kMaxTileM * kTileSize] __attribute__((aligned(64)));
-__thread_local float B_staging[2][kTileSize * kMaxTileN] __attribute__((aligned(64)));
 
 
 typedef struct {
@@ -29,12 +25,6 @@ typedef struct {
 // DMA (DDR -> Leader LDM)
 __thread_local volatile int dma_rply_A = 0;
 __thread_local volatile int dma_rply_B = 0;
-
-// RMA (Leader LDM -> Peer LDM)
-__thread_local volatile int rma_l_rply_A = 0; // 发起核的本地回答字
-__thread_local volatile int rma_r_rply_A = 0; // 接收核的远程回答字
-__thread_local volatile int rma_l_rply_B = 0;
-__thread_local volatile int rma_r_rply_B = 0;
 
 void gemm(void* params) {
     GemmParams* gemmParams = (GemmParams*)params;
@@ -69,75 +59,58 @@ void gemm(void* params) {
 
             // 初始化缓冲区索引（由 kSuper 循环内的 buf 控制 compute 双缓冲）
 
-            // 主循环：沿 K 维度按 kSuper 条带处理；每核先 DMA 一次覆盖本轮，再进行 8 轮 RMA + 计算
-            // kSuper = kTileSize * 8：每轮广播处理 kTileSize 个 K 元素，8 轮正好覆盖完整的条带
-            const int kSuper = kTileSize * 8;
-            for (int k_super = 0; k_super < K; k_super += kSuper) {
-                // 每核 DMA 自己的 Aτ/Bτ（curM×kTileSize 与 kTileSize×curN），偏移与核坐标相关
-                int a_k_off = k_super + (coreID_col % 8) * kTileSize;
-                int b_k_off = k_super + (coreID_row % 8) * kTileSize;
+            // 主循环：沿 K 维度按固定宽度（kTileSize）分块，仅使用 DMA 搬运
+            for (int k_block = 0; k_block < K; k_block += kTileSize) {
+                int curK = (k_block + kTileSize <= K) ? kTileSize : (K - k_block);
+
                 dma_rply_A = 0;
                 athread_dma_iget_stride(
-                    A_staging[0],
-                    &A_global[(row_start + tm) * K + a_k_off],
-                    curM * kTileSize * sizeof(float),
-                    kTileSize * sizeof(float),
-                    (K - kTileSize) * sizeof(float),
+                    A_panel,
+                    &A_global[(row_start + tm) * K + k_block],
+                    curM * curK * sizeof(float),
+                    curK * sizeof(float),
+                    (K - curK) * sizeof(float),
                     &dma_rply_A);
                 dma_rply_B = 0;
                 athread_dma_iget_stride(
-                    B_staging[0],
-                    &B_global[b_k_off * N + (col_start + tn)],
-                    kTileSize * curN * sizeof(float),
+                    B_panel,
+                    &B_global[k_block * N + (col_start + tn)],
+                    curK * curN * sizeof(float),
                     curN * sizeof(float),
                     (N - curN) * sizeof(float),
                     &dma_rply_B);
                 athread_dma_wait_value(&dma_rply_A, 1);
                 athread_dma_wait_value(&dma_rply_B, 1);
 
-                // 轮转 8 次：u=0..7
-                for (int u = 0; u < 8; ++u) {
-                    int buf = u % 2; // compute 双缓冲：偶数轮用0，奇数轮用1
-                    // cid==u 广播 A
-                    if (coreID_col == u) {
-                        rma_l_rply_A = 0; rma_r_rply_A = 0;
-                        athread_rma_row_ibcast(A_compute[buf], A_staging[0], curM * kTileSize * sizeof(float), &rma_l_rply_A, &rma_r_rply_A);
-                    }
-                    // rid==u 广播 B
-                    if (coreID_row == u) {
-                        rma_l_rply_B = 0; rma_r_rply_B = 0;
-                        athread_rma_col_ibcast(B_compute[buf], &B_staging[0][0], curN * kTileSize * sizeof(float), &rma_l_rply_B, &rma_r_rply_B);
-                    }
-                    athread_ssync(ROW_SCOPE, 0xff); athread_rma_wait_value(&rma_r_rply_A, 1);
-                    athread_ssync(COL_SCOPE, 0xff); athread_rma_wait_value(&rma_r_rply_B, 1);
-
-                    // 计算 32
-                    float* const __restrict__ current_A = A_compute[buf];
-                    float* const __restrict__ current_B = B_compute[buf];
-                    float* const __restrict__ current_C = C_ldm;
-                    for (int i = 0; i < curM; i += 4) {
-                        for (int j = 0; j < curN; j += 8) {
-                            floatv8 c_sum_0, c_sum_1, c_sum_2, c_sum_3;
-                            simd_load(c_sum_0, &current_C[(i + 0) * curN + j]);
-                            simd_load(c_sum_1, &current_C[(i + 1) * curN + j]);
-                            simd_load(c_sum_2, &current_C[(i + 2) * curN + j]);
-                            simd_load(c_sum_3, &current_C[(i + 3) * curN + j]);
-                            for (int k_inner = 0; k_inner < kTileSize; ++k_inner) {
-                                floatv8 b_vec; simd_load(b_vec, &current_B[k_inner * curN + j]);
-                                float a0 = current_A[i * kTileSize + k_inner];
-                                float a1 = current_A[(i + 1) * kTileSize + k_inner];
-                                float a2 = current_A[(i + 2) * kTileSize + k_inner];
-                                float a3 = current_A[(i + 3) * kTileSize + k_inner];
-                                c_sum_0 = simd_vmas(simd_set_floatv8(a0, a0, a0, a0, a0, a0, a0, a0), b_vec, c_sum_0);
-                                c_sum_1 = simd_vmas(simd_set_floatv8(a1, a1, a1, a1, a1, a1, a1, a1), b_vec, c_sum_1);
-                                c_sum_2 = simd_vmas(simd_set_floatv8(a2, a2, a2, a2, a2, a2, a2, a2), b_vec, c_sum_2);
-                                c_sum_3 = simd_vmas(simd_set_floatv8(a3, a3, a3, a3, a3, a3, a3, a3), b_vec, c_sum_3);
-                            }
-                            simd_store(c_sum_0, &current_C[(i + 0) * curN + j]);
-                            simd_store(c_sum_1, &current_C[(i + 1) * curN + j]);
-                            simd_store(c_sum_2, &current_C[(i + 2) * curN + j]);
-                            simd_store(c_sum_3, &current_C[(i + 3) * curN + j]);
+                float* const __restrict__ current_A = A_panel;
+                float* const __restrict__ current_B = B_panel;
+                float* const __restrict__ current_C = C_ldm;
+                for (int i = 0; i < curM; i += 4) {
+                    for (int j = 0; j < curN; j += 8) {
+                        floatv8 c_sum_0, c_sum_1, c_sum_2, c_sum_3;
+                        simd_load(c_sum_0, &current_C[(i + 0) * curN + j]);
+                        simd_load(c_sum_1, &current_C[(i + 1) * curN + j]);
+                        simd_load(c_sum_2, &current_C[(i + 2) * curN + j]);
+                        simd_load(c_sum_3, &current_C[(i + 3) * curN + j]);
+                        for (int k_inner = 0; k_inner < curK; ++k_inner) {
+                            floatv8 b_vec; simd_load(b_vec, &current_B[k_inner * curN + j]);
+                            float a0 = current_A[(i + 0) * curK + k_inner];
+                            float a1 = current_A[(i + 1) * curK + k_inner];
+                            float a2 = current_A[(i + 2) * curK + k_inner];
+                            float a3 = current_A[(i + 3) * curK + k_inner];
+                            floatv8 a0_vec = simd_set_floatv8(a0, a0, a0, a0, a0, a0, a0, a0);
+                            floatv8 a1_vec = simd_set_floatv8(a1, a1, a1, a1, a1, a1, a1, a1);
+                            floatv8 a2_vec = simd_set_floatv8(a2, a2, a2, a2, a2, a2, a2, a2);
+                            floatv8 a3_vec = simd_set_floatv8(a3, a3, a3, a3, a3, a3, a3, a3);
+                            c_sum_0 = simd_vmas(a0_vec, b_vec, c_sum_0);
+                            c_sum_1 = simd_vmas(a1_vec, b_vec, c_sum_1);
+                            c_sum_2 = simd_vmas(a2_vec, b_vec, c_sum_2);
+                            c_sum_3 = simd_vmas(a3_vec, b_vec, c_sum_3);
                         }
+                        simd_store(c_sum_0, &current_C[(i + 0) * curN + j]);
+                        simd_store(c_sum_1, &current_C[(i + 1) * curN + j]);
+                        simd_store(c_sum_2, &current_C[(i + 2) * curN + j]);
+                        simd_store(c_sum_3, &current_C[(i + 3) * curN + j]);
                     }
                 }
             }
