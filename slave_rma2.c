@@ -1,7 +1,6 @@
 #include <slave.h>
 #include <simd.h>
 #include <string.h>
-#include <ldm_malloc.h>
 
 #define kTileSize 32  // 每次沿 K 维度处理的列数
 
@@ -10,8 +9,14 @@
 #define kMaxTileN 64
 
 // --- LDM 内存布局 ---
-// C 缓冲区 (所有核共有)
+// 1. 计算缓冲区 (所有核都有): 用于 SIMD 计算，需要双缓冲
+__thread_local float A_compute[2][kMaxTileM * kTileSize] __attribute__((aligned(64)));
+__thread_local float B_compute[2][kTileSize * kMaxTileN] __attribute__((aligned(64)));
 __thread_local float C_ldm[kMaxTileM * kMaxTileN] __attribute__((aligned(64)));
+
+// 2. DMA 中转缓冲区：领导核用于从 DDR 搬运数据，再通过 RMA 广播给同行/列
+__thread_local float A_stage[2][kMaxTileM * kTileSize] __attribute__((aligned(64)));
+__thread_local float B_stage[2][kTileSize * kMaxTileN] __attribute__((aligned(64)));
 
 
 typedef struct {
@@ -39,48 +44,6 @@ void gemm(void* params) {
     int M = gemmParams->M, N = gemmParams->N, K = gemmParams->K;
     int base_tileM = gemmParams->tileM, base_tileN = gemmParams->tileN;
     int coreID_row = _ROW, coreID_col = _COL;
-
-    int isColLeader = (coreID_col == 0);
-    int isRowLeader = (coreID_row == 0);
-
-    const int aPanelSize = kMaxTileM * kTileSize;
-    const int bPanelSize = kTileSize * kMaxTileN;
-
-    float* A_stage[2] = { NULL, NULL };
-    float* B_stage[2] = { NULL, NULL };
-    float* A_compute[2] = { NULL, NULL };
-    float* B_compute[2] = { NULL, NULL };
-
-    // 领导核为广播准备 staging 缓冲区，其余核准备 compute 缓冲区
-    for (int buf = 0; buf < 2; ++buf) {
-        if (isColLeader) {
-            A_stage[buf] = (float*)ldm_malloc(aPanelSize * sizeof(float));
-        }
-        else {
-            A_compute[buf] = (float*)ldm_malloc(aPanelSize * sizeof(float));
-        }
-
-        if (isRowLeader) {
-            B_stage[buf] = (float*)ldm_malloc(bPanelSize * sizeof(float));
-        }
-        else {
-            B_compute[buf] = (float*)ldm_malloc(bPanelSize * sizeof(float));
-        }
-
-        if ((isColLeader && A_stage[buf] == NULL) ||
-            (!isColLeader && A_compute[buf] == NULL) ||
-            (isRowLeader && B_stage[buf] == NULL) ||
-            (!isRowLeader && B_compute[buf] == NULL)) {
-            // 内存不足，提前返回，避免后续使用空指针
-            for (int release = 0; release <= buf; ++release) {
-                if (isColLeader && A_stage[release]) ldm_free(A_stage[release], aPanelSize * sizeof(float));
-                if (!isColLeader && A_compute[release]) ldm_free(A_compute[release], aPanelSize * sizeof(float));
-                if (isRowLeader && B_stage[release]) ldm_free(B_stage[release], bPanelSize * sizeof(float));
-                if (!isRowLeader && B_compute[release]) ldm_free(B_compute[release], bPanelSize * sizeof(float));
-            }
-            return;
-        }
-    }
 
     // --- 边界计算 ---
     const int CORE_GRID_DIM = 8;
@@ -120,7 +83,7 @@ void gemm(void* params) {
             if (tilesStarted < totalTiles) {
                 int curK = (kBlock + kTileSize <= K) ? kTileSize : (K - kBlock);
                 stageLen[next] = curK;
-                if (isColLeader) {
+                if (coreID_col == 0) {
                     dma_rply_A_stage[next] = 0;
                     athread_dma_iget_stride(
                         A_stage[next],
@@ -130,7 +93,7 @@ void gemm(void* params) {
                         (K - curK) * sizeof(float),
                         &dma_rply_A_stage[next]);
                 }
-                if (isRowLeader) {
+                if (coreID_row == 0) {
                     dma_rply_B_stage[next] = 0;
                     athread_dma_iget_stride(
                         B_stage[next],
@@ -143,29 +106,25 @@ void gemm(void* params) {
                 tilesStarted++;
                 kBlock += curK;
             }
-            if (isColLeader && stageLen[next] > 0) athread_dma_wait_value(&dma_rply_A_stage[next], 1);
-            if (isRowLeader && stageLen[next] > 0) athread_dma_wait_value(&dma_rply_B_stage[next], 1);
+            if (coreID_col == 0 && stageLen[next] > 0) athread_dma_wait_value(&dma_rply_A_stage[next], 1);
+            if (coreID_row == 0 && stageLen[next] > 0) athread_dma_wait_value(&dma_rply_B_stage[next], 1);
 
             // --- Step3: 通过 RMA 将 staging[next] 分发到 compute[next] ---
             if (stageLen[next] > 0) {
-                float* A_dest_next = isColLeader ? A_stage[next] : A_compute[next];
-                float* B_dest_next = isRowLeader ? B_stage[next] : B_compute[next];
-                if (isColLeader) {
+                if (coreID_col == 0) {
                     rma_l_rply_A[next] = 0; rma_r_rply_A[next] = 0;
-                    athread_rma_row_ibcast(A_dest_next, A_stage[next], curM * stageLen[next] * sizeof(float),
+                    athread_rma_row_ibcast(A_compute[next], A_stage[next], curM * stageLen[next] * sizeof(float),
                         &rma_l_rply_A[next], &rma_r_rply_A[next]);
                 }
-                if (isRowLeader) {
+                if (coreID_row == 0) {
                     rma_l_rply_B[next] = 0; rma_r_rply_B[next] = 0;
-                    athread_rma_col_ibcast(B_dest_next, B_stage[next], stageLen[next] * curN * sizeof(float),
+                    athread_rma_col_ibcast(B_compute[next], B_stage[next], stageLen[next] * curN * sizeof(float),
                         &rma_l_rply_B[next], &rma_r_rply_B[next]);
                 }
                 athread_ssync(ROW_SCOPE, 0xff);
-                if (isColLeader) athread_rma_wait_value(&rma_r_rply_A[next], 1);
+                if (coreID_col == 0) athread_rma_wait_value(&rma_r_rply_A[next], 1);
                 athread_ssync(COL_SCOPE, 0xff);
-                if (isRowLeader) athread_rma_wait_value(&rma_r_rply_B[next], 1);
-                A_compute[next] = isColLeader ? A_stage[next] : A_dest_next;
-                B_compute[next] = isRowLeader ? B_stage[next] : B_dest_next;
+                if (coreID_row == 0) athread_rma_wait_value(&rma_r_rply_B[next], 1);
                 computeLen[next] = stageLen[next];
                 stageLen[next] = 0;
             }
@@ -174,7 +133,7 @@ void gemm(void* params) {
             if (tilesStarted < totalTiles) {
                 int curK = (kBlock + kTileSize <= K) ? kTileSize : (K - kBlock);
                 stageLen[now] = curK;
-                if (isColLeader) {
+                if (coreID_col == 0) {
                     dma_rply_A_stage[now] = 0;
                     athread_dma_iget_stride(
                         A_stage[now],
@@ -184,7 +143,7 @@ void gemm(void* params) {
                         (K - curK) * sizeof(float),
                         &dma_rply_A_stage[now]);
                 }
-                if (isRowLeader) {
+                if (coreID_row == 0) {
                     dma_rply_B_stage[now] = 0;
                     athread_dma_iget_stride(
                         B_stage[now],
@@ -208,8 +167,8 @@ void gemm(void* params) {
                 athread_ssync(COL_SCOPE, 0xff);
 
                 int curK = computeLen[now];
-                float* const __restrict__ current_A = isColLeader ? A_stage[now] : A_compute[now];
-                float* const __restrict__ current_B = isRowLeader ? B_stage[now] : B_compute[now];
+                float* const __restrict__ current_A = A_compute[now];
+                float* const __restrict__ current_B = B_compute[now];
                 float* const __restrict__ current_C = C_ldm;
 
                 for (int i = 0; i < curM; i += 4) {
@@ -247,27 +206,23 @@ void gemm(void* params) {
 
                 // 5.2 等待 DMA 完成并广播到 compute[next]
                 if (stageLen[next] > 0) {
-                    if (isColLeader) athread_dma_wait_value(&dma_rply_A_stage[next], 1);
-                    if (isRowLeader) athread_dma_wait_value(&dma_rply_B_stage[next], 1);
+                    if (coreID_col == 0) athread_dma_wait_value(&dma_rply_A_stage[next], 1);
+                    if (coreID_row == 0) athread_dma_wait_value(&dma_rply_B_stage[next], 1);
 
-                    float* A_dest_next2 = isColLeader ? A_stage[next] : A_compute[next];
-                    float* B_dest_next2 = isRowLeader ? B_stage[next] : B_compute[next];
-                    if (isColLeader) {
+                    if (coreID_col == 0) {
                         rma_l_rply_A[next] = 0; rma_r_rply_A[next] = 0;
-                        athread_rma_row_ibcast(A_dest_next2, A_stage[next], curM * stageLen[next] * sizeof(float),
+                        athread_rma_row_ibcast(A_compute[next], A_stage[next], curM * stageLen[next] * sizeof(float),
                             &rma_l_rply_A[next], &rma_r_rply_A[next]);
                     }
-                    if (isRowLeader) {
+                    if (coreID_row == 0) {
                         rma_l_rply_B[next] = 0; rma_r_rply_B[next] = 0;
-                        athread_rma_col_ibcast(B_dest_next2, B_stage[next], stageLen[next] * curN * sizeof(float),
+                        athread_rma_col_ibcast(B_compute[next], B_stage[next], stageLen[next] * curN * sizeof(float),
                             &rma_l_rply_B[next], &rma_r_rply_B[next]);
                     }
                     athread_ssync(ROW_SCOPE, 0xff);
-                    if (isColLeader) athread_rma_wait_value(&rma_r_rply_A[next], 1);
+                    if (coreID_col == 0) athread_rma_wait_value(&rma_r_rply_A[next], 1);
                     athread_ssync(COL_SCOPE, 0xff);
-                    if (isRowLeader) athread_rma_wait_value(&rma_r_rply_B[next], 1);
-                    A_compute[next] = isColLeader ? A_stage[next] : A_dest_next2;
-                    B_compute[next] = isRowLeader ? B_stage[next] : B_dest_next2;
+                    if (coreID_row == 0) athread_rma_wait_value(&rma_r_rply_B[next], 1);
                     computeLen[next] = stageLen[next];
                     stageLen[next] = 0;
                 }
@@ -276,7 +231,7 @@ void gemm(void* params) {
                 if (tilesStarted < totalTiles) {
                     int curK_next = (kBlock + kTileSize <= K) ? kTileSize : (K - kBlock);
                     stageLen[now] = curK_next;
-                    if (isColLeader) {
+                    if (coreID_col == 0) {
                         dma_rply_A_stage[now] = 0;
                         athread_dma_iget_stride(
                             A_stage[now],
@@ -286,7 +241,7 @@ void gemm(void* params) {
                             (K - curK_next) * sizeof(float),
                             &dma_rply_A_stage[now]);
                     }
-                    if (isRowLeader) {
+                    if (coreID_row == 0) {
                         dma_rply_B_stage[now] = 0;
                         athread_dma_iget_stride(
                             B_stage[now],
@@ -312,22 +267,6 @@ void gemm(void* params) {
                 (N - curN) * sizeof(float),
                 &dma_rply_C);
             athread_dma_wait_value(&dma_rply_C, 1);
-        }
-    }
-
-    for (int buf = 0; buf < 2; ++buf) {
-        if (isColLeader) {
-            if (A_stage[buf]) ldm_free(A_stage[buf], aPanelSize * sizeof(float));
-        }
-        else {
-            if (A_compute[buf]) ldm_free(A_compute[buf], aPanelSize * sizeof(float));
-        }
-
-        if (isRowLeader) {
-            if (B_stage[buf]) ldm_free(B_stage[buf], bPanelSize * sizeof(float));
-        }
-        else {
-            if (B_compute[buf]) ldm_free(B_compute[buf], bPanelSize * sizeof(float));
         }
     }
 }

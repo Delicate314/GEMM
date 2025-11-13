@@ -3,13 +3,8 @@
 #include <chrono>
 #include <random>
 #include <cmath>   // For fabs
+#include <string>
 #include <athread.h> // 主核接口
-
-// --- 配置 ---
-// 矩阵维度
-const int M = 2048;
-const int N = 2048;
-const int K = 2048;
 
 // 是否执行主核计算并验证结果
 const bool VERIFY_RESULT = true;
@@ -69,6 +64,23 @@ bool verify(const float* C_slave, const float* C_cpu, int m, int n) {
 
 
 int main(int argc, char* argv[]) {
+    int M = 2048;
+    int N = 2048;
+    int K = 2048;
+
+    if (argc == 4) {
+        M = std::stoi(argv[1]);
+        N = std::stoi(argv[2]);
+        K = std::stoi(argv[3]);
+    }
+    else if (argc == 1) {
+        std::cout << "[Info] Using default size M=N=K=2048.\n";
+    }
+    else {
+        std::cerr << "Usage: " << argv[0] << " [M N K]\n";
+        return 1;
+    }
+
     // 1. 初始化申威线程环境
     athread_init();
 

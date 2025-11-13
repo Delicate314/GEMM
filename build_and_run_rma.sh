@@ -6,18 +6,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # ================================
-# 构建阶段（原 build.sh 内容）
+# 构建阶段
 # ================================
 echo "=== Building project ==="
 swgcc -mslave -O3 -msimd -funroll-loops slave_rma.c -c -o slave.o #-funroll-loops
 swgcc -faddress_align=128 -mhost -msimd -O3 master.c -c -o master.o
 swg++ -faddress_align=128 -mhost -msimd -O3 main.cpp -c -o main.o
-swg++ -mhybrid -static main.o master.o slave.o -o exe
+swg++ -mhybrid -static main.o master.o slave.o -o gemm_rma.exe
 echo "=== Build finished ==="
 
 
 # ================================
-# 提交阶段（原 run2.sh 内容）
+# 提交阶段
 # ================================
 QUEUE="q_sw_expr"
 RESULT_DIR="./results/rma"
@@ -25,8 +25,12 @@ DATE_DIR="$RESULT_DIR/$(date +"%Y%m%d")"
 mkdir -p "$DATE_DIR"
 
 EXEC_FILES=(
-    "exe"
+    "gemm_rma.exe"
 )
+
+M_DIM=${1:-2048}
+N_DIM=${2:-2048}
+K_DIM=${3:-2048}
 
 echo "=== Submitting jobs ==="
 for EXEC_FILE in "${EXEC_FILES[@]}"; do
@@ -35,7 +39,7 @@ for EXEC_FILE in "${EXEC_FILES[@]}"; do
         RUN_TIME=$(date +"%H%M%S")
         LOG_FILE="$DATE_DIR/$(basename "$EXEC_FILE")_${RUN_TIME}.log"
         bsub -b -q "$QUEUE" -shared -n 1 -cgsp 64 -share_size 15000 \
-             -o "$LOG_FILE" "./$EXEC_FILE"
+             -o "$LOG_FILE" "./$EXEC_FILE" "$M_DIM" "$N_DIM" "$K_DIM"
         if [ $? -ne 0 ]; then
             echo "提交失败: ./$EXEC_FILE（请查看集群返回信息）"
         else
