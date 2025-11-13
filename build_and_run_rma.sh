@@ -9,7 +9,7 @@ cd "$SCRIPT_DIR"
 # 构建阶段（原 build.sh 内容）
 # ================================
 echo "=== Building project ==="
-swgcc -mslave -O3 -msimd -funroll-loops slave.c -c -o slave.o #-funroll-loops
+swgcc -mslave -O3 -msimd -funroll-loops slave_rma.c -c -o slave.o #-funroll-loops
 swgcc -faddress_align=128 -mhost -msimd -O3 master.c -c -o master.o
 swg++ -faddress_align=128 -mhost -msimd -O3 main.cpp -c -o main.o
 swg++ -mhybrid -static main.o master.o slave.o -o exe
@@ -20,7 +20,7 @@ echo "=== Build finished ==="
 # 提交阶段（原 run2.sh 内容）
 # ================================
 QUEUE="q_sw_expr"
-RESULT_DIR="./results"
+RESULT_DIR="./results/rma"
 DATE_DIR="$RESULT_DIR/$(date +"%Y%m%d")"
 mkdir -p "$DATE_DIR"
 
