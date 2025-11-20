@@ -1,7 +1,6 @@
 #include <iostream>
 #include <vector>
 #include <chrono>
-#include <random>
 #include <cmath>   // For fabs
 #include <string>
 #include <athread.h> // 主核接口
@@ -15,17 +14,18 @@ extern "C" void GEMM(float* A, float* B, float* C, int M, int N, int K, int tile
 
 
 /**
- * @brief 使用随机浮点数初始化一个一维数组表示的矩阵
+ * @brief 初始化矩阵：编码行列信息（整数部分为行号，小数部分为列号/10000）
  * @param mat 指向矩阵内存的指针
  * @param rows 矩阵行数
  * @param cols 矩阵列数
  */
 void initialize_matrix(float* mat, int rows, int cols) {
-    static std::mt19937 rng(0); // 固定种子，保证可重复
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-    for (int i = 0; i < rows * cols; ++i) {
-        mat[i] = dist(rng);
-        // mat[i] = 1.0f; // 调试：全部填充为 1
+    for (int i = 0; i < rows; ++i) {
+        for (int j = 0; j < cols; ++j) {
+            int idx = i * cols + j;
+            mat[idx] = static_cast<float>(i) * 0.001f + static_cast<float>(j) * 0.000001f;
+            // mat[idx] =1.0f;
+        }
     }
 }
 
@@ -92,7 +92,7 @@ int main(int argc, char* argv[]) {
     float* C_slave = new float[M * N]; // 用于存储从核计算结果
 
     // 3. 初始化矩阵
-    std::cout << "Initializing matrices A and B with random values..." << std::endl;
+    std::cout << "Initializing matrices A and B (value = row*0.001 + col*0.000001)..." << std::endl;
     initialize_matrix(A, M, K);
     initialize_matrix(B, K, N);
 

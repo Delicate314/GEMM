@@ -1,17 +1,37 @@
 #include <slave.h>
 #include <simd.h>
 #include <string.h>
-#include <ldm_malloc.h>
+#include <stdio.h>
+
+static inline void print_top_left_block(
+    const char* tag,
+    int core_row, int core_col,
+    const float* data, int rows, int cols, int ld) {
+    printf("%s Core(%d,%d) rows=%d cols=%d\n",
+        tag, core_row, core_col, rows, cols);
+    for (int r = 0; r < rows; ++r) {
+        printf("    ");
+        for (int c = 0; c < cols; ++c) {
+            printf("%f ", data[r * ld + c]);
+        }
+        printf("\n");
+    }
+}
 
 #define kTileSize 32  // 每次沿 K 维度处理的列数
+#define kSuperSize (8 * kTileSize)  // 每次处理 8 倍的 K 维度数据（256）
 
 // 每核 C 分块最大尺寸（单位：行/列）
-#define kMaxTileM 64
-#define kMaxTileN 64
+#define ASM_KMAXTILEM 64
+#define ASM_KMAXTILEN 64
 
 // --- LDM 内存布局 ---
-// C 缓冲区 (所有核共有)
-__thread_local float C_ldm[kMaxTileM * kMaxTileN] __attribute__((aligned(64)));
+// 每个从核都有 5 个 buffer
+__thread_local float A_stage[ASM_KMAXTILEM * kTileSize] __attribute__((aligned(64)));  // DMA 缓冲区：每个从核 DMA 自己需要的 A 数据
+__thread_local float B_stage[kTileSize * ASM_KMAXTILEN] __attribute__((aligned(64)));  // DMA 缓冲区：每个从核 DMA 自己需要的 B 数据
+__thread_local float A_compute[ASM_KMAXTILEM * kTileSize] __attribute__((aligned(64)));  // 计算缓冲区：RMA 接收后的 A 数据
+__thread_local float B_compute[kTileSize * ASM_KMAXTILEN] __attribute__((aligned(64)));  // 计算缓冲区：RMA 接收后的 B 数据
+__thread_local float C_ldm[ASM_KMAXTILEM * ASM_KMAXTILEN] __attribute__((aligned(64)));  // 结果缓冲区
 
 
 typedef struct {
@@ -22,14 +42,14 @@ typedef struct {
 
 // --- DMA/RMA 回答字 ---
 // DMA (DDR -> Leader LDM)
-__thread_local volatile int dma_rply_A_stage[2];
-__thread_local volatile int dma_rply_B_stage[2];
+__thread_local volatile int dma_rply_A = 0;
+__thread_local volatile int dma_rply_B = 0;
 
 // RMA (Leader LDM -> Peer LDM)
-__thread_local volatile int rma_l_rply_A[2];
-__thread_local volatile int rma_r_rply_A[2];
-__thread_local volatile int rma_l_rply_B[2];
-__thread_local volatile int rma_r_rply_B[2];
+__thread_local athread_rply_t rma_l_rply_A;  // A 的本地回答字（非阻塞版需要）
+__thread_local athread_rply_t rma_r_rply_A;  // A 的远程回答字
+__thread_local athread_rply_t rma_l_rply_B;  // B 的本地回答字（非阻塞版需要）
+__thread_local athread_rply_t rma_r_rply_B;  // B 的远程回答字
 
 void gemm(void* params) {
     GemmParams* gemmParams = (GemmParams*)params;
@@ -39,48 +59,6 @@ void gemm(void* params) {
     int M = gemmParams->M, N = gemmParams->N, K = gemmParams->K;
     int base_tileM = gemmParams->tileM, base_tileN = gemmParams->tileN;
     int coreID_row = _ROW, coreID_col = _COL;
-
-    int isColLeader = (coreID_col == 0);
-    int isRowLeader = (coreID_row == 0);
-
-    const int aPanelSize = kMaxTileM * kTileSize;
-    const int bPanelSize = kTileSize * kMaxTileN;
-
-    float* A_stage[2] = { NULL, NULL };
-    float* B_stage[2] = { NULL, NULL };
-    float* A_compute[2] = { NULL, NULL };
-    float* B_compute[2] = { NULL, NULL };
-
-    // 领导核为广播准备 staging 缓冲区，其余核准备 compute 缓冲区
-    for (int buf = 0; buf < 2; ++buf) {
-        if (isColLeader) {
-            A_stage[buf] = (float*)ldm_malloc(aPanelSize * sizeof(float));
-        }
-        else {
-            A_compute[buf] = (float*)ldm_malloc(aPanelSize * sizeof(float));
-        }
-
-        if (isRowLeader) {
-            B_stage[buf] = (float*)ldm_malloc(bPanelSize * sizeof(float));
-        }
-        else {
-            B_compute[buf] = (float*)ldm_malloc(bPanelSize * sizeof(float));
-        }
-
-        if ((isColLeader && A_stage[buf] == NULL) ||
-            (!isColLeader && A_compute[buf] == NULL) ||
-            (isRowLeader && B_stage[buf] == NULL) ||
-            (!isRowLeader && B_compute[buf] == NULL)) {
-            // 内存不足，提前返回，避免后续使用空指针
-            for (int release = 0; release <= buf; ++release) {
-                if (isColLeader && A_stage[release]) ldm_free(A_stage[release], aPanelSize * sizeof(float));
-                if (!isColLeader && A_compute[release]) ldm_free(A_compute[release], aPanelSize * sizeof(float));
-                if (isRowLeader && B_stage[release]) ldm_free(B_stage[release], bPanelSize * sizeof(float));
-                if (!isRowLeader && B_compute[release]) ldm_free(B_compute[release], bPanelSize * sizeof(float));
-            }
-            return;
-        }
-    }
 
     // --- 边界计算 ---
     const int CORE_GRID_DIM = 8;
@@ -92,216 +70,167 @@ void gemm(void* params) {
     // my_tileM/my_tileN 计算方式：对落在余数段内的核多给 1 行/列，实现均匀分配
     int my_tileM = base_tileM + (coreID_row < remainder_M ? 1 : 0);
     int my_tileN = base_tileN + (coreID_col < remainder_N ? 1 : 0);
+    // if (coreID_row == 0 && (coreID_col == 0 || coreID_col == CORE_GRID_DIM - 1)) {
+    //     printf("[Debug] Core(%d,%d) my_tileM = %d\n", coreID_row, coreID_col, my_tileM);
+    // }
+    // if (coreID_col == 0 && (coreID_row == 0 || coreID_row == CORE_GRID_DIM - 1)) {
+    //     printf("[Debug] Core(%d,%d) my_tileN = %d\n", coreID_row, coreID_col, my_tileN);
+    // }
 
-    // === 每核按最多 128x128 的块在行列方向分片（必要时处理尾块）===
-    for (int tm = 0; tm < my_tileM; tm += kMaxTileM) {
+    // === 每核按最多 64x64 的块在行列方向分片（必要时处理尾块）===
+    for (int tm = 0; tm < my_tileM; tm += ASM_KMAXTILEM) {
         // 计算当前子块的实际行数 curM：
-        // - 如果 tm + kMaxTileM <= my_tileM，说明剩余行数足够一个完整的 kMaxTileM(128行)，则 curM = kMaxTileM
-        // - 否则，这是最后一个子块，剩余行数不足128行，则 curM = my_tileM - tm（剩余的行数）
-        int curM = (tm + kMaxTileM <= my_tileM) ? kMaxTileM : (my_tileM - tm);
-        for (int tn = 0; tn < my_tileN; tn += kMaxTileN) {
-            int curN = (tn + kMaxTileN <= my_tileN) ? kMaxTileN : (my_tileN - tn);
+        // - 如果 tm + ASM_KMAXTILEM <= my_tileM，说明剩余行数足够一个完整的 ASM_KMAXTILEM(64行)，则 curM = ASM_KMAXTILEM
+        // - 否则，这是最后一个子块，剩余行数不足64行，则 curM = my_tileM - tm（剩余的行数）
+        int curM = (tm + ASM_KMAXTILEM <= my_tileM) ? ASM_KMAXTILEM : (my_tileM - tm);
+        for (int tn = 0; tn < my_tileN; tn += ASM_KMAXTILEN) {
+            int curN = (tn + ASM_KMAXTILEN <= my_tileN) ? ASM_KMAXTILEN : (my_tileN - tn);
             // 清零当前子块 C（仅使用当前子块的实际尺寸）
-            for (int idx = 0; idx < curM * curN; ++idx) C_ldm[idx] = 0.0f;
+            memset(C_ldm, 0, sizeof(float) * curM * curN);
 
-            // --- K 方向流水线：DMA + RMA 双缓冲 ---
-            int totalTiles = (K + kTileSize - 1) / kTileSize;
-            if (totalTiles == 0) continue;
+            // 主循环：沿 K 维度按 kSuperSize (8 * kTileSize) 分块
+            for (int k_block = 0; k_block < K; k_block += kSuperSize) {
+                int curKSuper = (k_block + kSuperSize <= K) ? kSuperSize : (K - k_block);
+                int numKTiles = (curKSuper + kTileSize - 1) / kTileSize;  // 实际需要处理的 kTileSize 块数（最多8个）
 
-            int now = 0, next = 1;
-            int tilesStarted = 0;   // 已经发起 DMA 的 K 面板数
-            int tilesDone = 0;      // 已经完成计算的面板数
-            int kBlock = 0;         // 下一次 DMA 的 K 维起始偏移
+                // === 阶段1：每个从核 DMA 自己负责的 A / B 子块 ===
+                // A 子块：按行划分（rid 决定 K 偏移），B 子块：按列划分（cid 决定 K 偏移）
+                int k_offset_A = coreID_col * kTileSize;
+                int k_offset_B = coreID_row * kTileSize;
+                int curK_A = 0;
+                int curK_B = 0;
 
-            int stageLen[2] = { 0, 0 };
-            int computeLen[2] = { 0, 0 };
-
-            // --- Step1 & Step2: 预取第一块到 staging[next] 并等待 ---
-            if (tilesStarted < totalTiles) {
-                int curK = (kBlock + kTileSize <= K) ? kTileSize : (K - kBlock);
-                stageLen[next] = curK;
-                if (isColLeader) {
-                    dma_rply_A_stage[next] = 0;
+                if (k_offset_A < curKSuper) {
+                    curK_A = (k_offset_A + kTileSize <= curKSuper) ? kTileSize : (curKSuper - k_offset_A);
+                    dma_rply_A = 0;
                     athread_dma_iget_stride(
-                        A_stage[next],
-                        &A_global[(row_start + tm) * K + kBlock],
-                        curM * curK * sizeof(float),
-                        curK * sizeof(float),
-                        (K - curK) * sizeof(float),
-                        &dma_rply_A_stage[next]);
+                        A_stage,
+                        &A_global[(row_start + tm) * K + k_block + k_offset_A],
+                        curM * curK_A * sizeof(float),
+                        curK_A * sizeof(float),
+                        (K - curK_A) * sizeof(float),
+                        &dma_rply_A);
                 }
-                if (isRowLeader) {
-                    dma_rply_B_stage[next] = 0;
+
+                if (k_offset_B < curKSuper) {
+                    curK_B = (k_offset_B + kTileSize <= curKSuper) ? kTileSize : (curKSuper - k_offset_B);
+                    dma_rply_B = 0;
                     athread_dma_iget_stride(
-                        B_stage[next],
-                        &B_global[kBlock * N + (col_start + tn)],
-                        curK * curN * sizeof(float),
+                        B_stage,
+                        &B_global[(k_block + k_offset_B) * N + (col_start + tn)],
+                        curK_B * curN * sizeof(float),
                         curN * sizeof(float),
                         (N - curN) * sizeof(float),
-                        &dma_rply_B_stage[next]);
+                        &dma_rply_B);
                 }
-                tilesStarted++;
-                kBlock += curK;
-            }
-            if (isColLeader && stageLen[next] > 0) athread_dma_wait_value(&dma_rply_A_stage[next], 1);
-            if (isRowLeader && stageLen[next] > 0) athread_dma_wait_value(&dma_rply_B_stage[next], 1);
 
-            // --- Step3: 通过 RMA 将 staging[next] 分发到 compute[next] ---
-            if (stageLen[next] > 0) {
-                float* A_dest_next = isColLeader ? A_stage[next] : A_compute[next];
-                float* B_dest_next = isRowLeader ? B_stage[next] : B_compute[next];
-                if (isColLeader) {
-                    rma_l_rply_A[next] = 0; rma_r_rply_A[next] = 0;
-                    athread_rma_row_ibcast(A_dest_next, A_stage[next], curM * stageLen[next] * sizeof(float),
-                        &rma_l_rply_A[next], &rma_r_rply_A[next]);
+                if (k_offset_A < curKSuper) {
+                    athread_dma_wait_value(&dma_rply_A, 1);
+                    // if (curK_A > 0 && k_offset_A == 0 &&
+                    //     coreID_row == 0 && coreID_col == 0) {
+                    //     print_top_left_block(
+                    //         "[DMA A] top-left 5x5",
+                    //         coreID_row, coreID_col,
+                    //         A_stage, curM, curK_A, curK_A);
+                    // }
                 }
-                if (isRowLeader) {
-                    rma_l_rply_B[next] = 0; rma_r_rply_B[next] = 0;
-                    athread_rma_col_ibcast(B_dest_next, B_stage[next], stageLen[next] * curN * sizeof(float),
-                        &rma_l_rply_B[next], &rma_r_rply_B[next]);
+                if (k_offset_B < curKSuper) {
+                    athread_dma_wait_value(&dma_rply_B, 1);
+                    // if (curK_B > 0 && k_offset_B == 0 &&
+                    //     coreID_row == 0 && coreID_col == 0) {
+                    //     print_top_left_block(
+                    //         "[DMA B] top-left 5x5",
+                    //         coreID_row, coreID_col,
+                    //         B_stage, curK_B, curN, curN);
+                    // }
                 }
-                athread_ssync(ROW_SCOPE, 0xff);
-                if (isColLeader) athread_rma_wait_value(&rma_r_rply_A[next], 1);
-                athread_ssync(COL_SCOPE, 0xff);
-                if (isRowLeader) athread_rma_wait_value(&rma_r_rply_B[next], 1);
-                A_compute[next] = isColLeader ? A_stage[next] : A_dest_next;
-                B_compute[next] = isRowLeader ? B_stage[next] : B_dest_next;
-                computeLen[next] = stageLen[next];
-                stageLen[next] = 0;
-            }
 
-            // --- Step4: 预取下一块到 staging[now]（若存在） ---
-            if (tilesStarted < totalTiles) {
-                int curK = (kBlock + kTileSize <= K) ? kTileSize : (K - kBlock);
-                stageLen[now] = curK;
-                if (isColLeader) {
-                    dma_rply_A_stage[now] = 0;
-                    athread_dma_iget_stride(
-                        A_stage[now],
-                        &A_global[(row_start + tm) * K + kBlock],
-                        curM * curK * sizeof(float),
-                        curK * sizeof(float),
-                        (K - curK) * sizeof(float),
-                        &dma_rply_A_stage[now]);
-                }
-                if (isRowLeader) {
-                    dma_rply_B_stage[now] = 0;
-                    athread_dma_iget_stride(
-                        B_stage[now],
-                        &B_global[kBlock * N + (col_start + tn)],
-                        curK * curN * sizeof(float),
-                        curN * sizeof(float),
-                        (N - curN) * sizeof(float),
-                        &dma_rply_B_stage[now]);
-                }
-                tilesStarted++;
-                kBlock += curK;
-            }
-
-            // --- Step5: 主循环 ---
-            while (tilesDone < totalTiles) {
-                // 5.0 切换 now/next
-                int tmpBuf = now; now = next; next = tmpBuf;
-
-                // 5.1 等待数据准备完成（此处已在广播函数中阻塞，补一个同步即可）
-                athread_ssync(ROW_SCOPE, 0xff);
-                athread_ssync(COL_SCOPE, 0xff);
-
-                int curK = computeLen[now];
-                float* const __restrict__ current_A = isColLeader ? A_stage[now] : A_compute[now];
-                float* const __restrict__ current_B = isRowLeader ? B_stage[now] : B_compute[now];
-                float* const __restrict__ current_C = C_ldm;
-
-                for (int i = 0; i < curM; i += 4) {
-                    for (int j = 0; j < curN; j += 8) {
-                        floatv8 c_sum_0, c_sum_1, c_sum_2, c_sum_3;
-                        simd_load(c_sum_0, &current_C[(i + 0) * curN + j]);
-                        simd_load(c_sum_1, &current_C[(i + 1) * curN + j]);
-                        simd_load(c_sum_2, &current_C[(i + 2) * curN + j]);
-                        simd_load(c_sum_3, &current_C[(i + 3) * curN + j]);
-                        for (int k_inner = 0; k_inner < curK; ++k_inner) {
-                            floatv8 b_vec; simd_load(b_vec, &current_B[k_inner * curN + j]);
-                            float a0 = current_A[(i + 0) * curK + k_inner];
-                            float a1 = current_A[(i + 1) * curK + k_inner];
-                            float a2 = current_A[(i + 2) * curK + k_inner];
-                            float a3 = current_A[(i + 3) * curK + k_inner];
-                            floatv8 a0_vec = simd_set_floatv8(a0, a0, a0, a0, a0, a0, a0, a0);
-                            floatv8 a1_vec = simd_set_floatv8(a1, a1, a1, a1, a1, a1, a1, a1);
-                            floatv8 a2_vec = simd_set_floatv8(a2, a2, a2, a2, a2, a2, a2, a2);
-                            floatv8 a3_vec = simd_set_floatv8(a3, a3, a3, a3, a3, a3, a3, a3);
-                            c_sum_0 = simd_vmas(a0_vec, b_vec, c_sum_0);
-                            c_sum_1 = simd_vmas(a1_vec, b_vec, c_sum_1);
-                            c_sum_2 = simd_vmas(a2_vec, b_vec, c_sum_2);
-                            c_sum_3 = simd_vmas(a3_vec, b_vec, c_sum_3);
-                        }
-                        simd_store(c_sum_0, &current_C[(i + 0) * curN + j]);
-                        simd_store(c_sum_1, &current_C[(i + 1) * curN + j]);
-                        simd_store(c_sum_2, &current_C[(i + 2) * curN + j]);
-                        simd_store(c_sum_3, &current_C[(i + 3) * curN + j]);
-                    }
-                }
-                tilesDone++;
-                computeLen[now] = 0;
-
-                if (tilesDone >= totalTiles) break;
-
-                // 5.2 等待 DMA 完成并广播到 compute[next]
-                if (stageLen[next] > 0) {
-                    if (isColLeader) athread_dma_wait_value(&dma_rply_A_stage[next], 1);
-                    if (isRowLeader) athread_dma_wait_value(&dma_rply_B_stage[next], 1);
-
-                    float* A_dest_next2 = isColLeader ? A_stage[next] : A_compute[next];
-                    float* B_dest_next2 = isRowLeader ? B_stage[next] : B_compute[next];
-                    if (isColLeader) {
-                        rma_l_rply_A[next] = 0; rma_r_rply_A[next] = 0;
-                        athread_rma_row_ibcast(A_dest_next2, A_stage[next], curM * stageLen[next] * sizeof(float),
-                            &rma_l_rply_A[next], &rma_r_rply_A[next]);
-                    }
-                    if (isRowLeader) {
-                        rma_l_rply_B[next] = 0; rma_r_rply_B[next] = 0;
-                        athread_rma_col_ibcast(B_dest_next2, B_stage[next], stageLen[next] * curN * sizeof(float),
-                            &rma_l_rply_B[next], &rma_r_rply_B[next]);
-                    }
+                // === 阶段2：对 8 个 kTileSize 块进行循环，每次 RMA 广播并计算 ===
+                for (int k = 0; k < numKTiles; ++k) {
+                    int k_tile_offset = k * kTileSize;
+                    int curK = (k_tile_offset + kTileSize <= curKSuper) ? kTileSize : (curKSuper - k_tile_offset);
+                    rma_l_rply_A = 0;
+                    rma_r_rply_A = 0;
                     athread_ssync(ROW_SCOPE, 0xff);
-                    if (isColLeader) athread_rma_wait_value(&rma_r_rply_A[next], 1);
-                    athread_ssync(COL_SCOPE, 0xff);
-                    if (isRowLeader) athread_rma_wait_value(&rma_r_rply_B[next], 1);
-                    A_compute[next] = isColLeader ? A_stage[next] : A_dest_next2;
-                    B_compute[next] = isRowLeader ? B_stage[next] : B_dest_next2;
-                    computeLen[next] = stageLen[next];
-                    stageLen[next] = 0;
-                }
+                    // A 的行广播：同一列的所有核（cid==k）各自在本行内广播自己 DMA 到的 A 数据
+                    if (coreID_col == k) {
+                        // if (coreID_row == 0) {
+                        //     int print_rows = (curM < 5) ? curM : 5;
+                        //     int print_cols = (curK < 5) ? curK : 5;
+                        //     print_top_left_block(
+                        //         "[RMA A] top-left 5x5",
+                        //         coreID_row, coreID_col,
+                        //         A_stage, print_rows, print_cols, curK);
+                        // }
+                        athread_rma_row_ibcast(
+                            A_compute, A_stage,
+                            curM * curK * sizeof(float),
+                            &rma_l_rply_A,
+                            &rma_r_rply_A);
+                        athread_rma_wait_value(&rma_l_rply_A, 1);
+                    }
+                    athread_rma_wait_value(&rma_r_rply_A, 1);
 
-                // 5.36 发起下一块 DMA（若仍有剩余）
-                if (tilesStarted < totalTiles) {
-                    int curK_next = (kBlock + kTileSize <= K) ? kTileSize : (K - kBlock);
-                    stageLen[now] = curK_next;
-                    if (isColLeader) {
-                        dma_rply_A_stage[now] = 0;
-                        athread_dma_iget_stride(
-                            A_stage[now],
-                            &A_global[(row_start + tm) * K + kBlock],
-                            curM * curK_next * sizeof(float),
-                            curK_next * sizeof(float),
-                            (K - curK_next) * sizeof(float),
-                            &dma_rply_A_stage[now]);
+                    // B 的列广播：同一行的所有核（rid==k）在列内广播自己 DMA 到的 B 数据
+                    rma_l_rply_B = 0;
+                    rma_r_rply_B = 0;
+                    athread_ssync(COL_SCOPE, 0xff);
+                    if (coreID_row == k) {
+                        // if (coreID_col == 0) {
+                        //     int print_rows = (curK < 5) ? curK : 5;
+                        //     int print_cols = (curN < 5) ? curN : 5;
+                        //     print_top_left_block(
+                        //         "[RMA B] top-left 5x5",
+                        //         coreID_row, coreID_col,
+                        //         B_stage, print_rows, print_cols, curN);
+                        // }
+                        athread_rma_col_ibcast(
+                            B_compute, B_stage,
+                            curK * curN * sizeof(float),
+                            &rma_l_rply_B,
+                            &rma_r_rply_B);
+                        athread_rma_wait_value(&rma_l_rply_B, 1);
                     }
-                    if (isRowLeader) {
-                        dma_rply_B_stage[now] = 0;
-                        athread_dma_iget_stride(
-                            B_stage[now],
-                            &B_global[kBlock * N + (col_start + tn)],
-                            curK_next * curN * sizeof(float),
-                            curN * sizeof(float),
-                            (N - curN) * sizeof(float),
-                            &dma_rply_B_stage[now]);
+                    athread_rma_wait_value(&rma_r_rply_B, 1);
+
+                    // === 阶段3：SIMD 计算 ===
+                    // 每个从核使用 A_compute 和 B_compute 进行计算
+                    float* const __restrict__ current_C = C_ldm;
+                    float* const __restrict__ current_A = A_compute;
+                    float* const __restrict__ current_B = B_compute;
+                    // SIMD 计算：使用 SIMD 微内核
+                    // A_compute 布局：curM 行 × curK 列，第 i 行第 k 列 = A_compute[i * curK + k]
+                    // B_compute 布局：curK 行 × curN 列，第 k 行第 j 列 = B_compute[k * curN + j]
+                    for (int i = 0; i < curM; i += 4) {
+                        for (int j = 0; j < curN; j += 8) {
+                            floatv8 c_sum_0, c_sum_1, c_sum_2, c_sum_3;
+                            simd_load(c_sum_0, &current_C[(i + 0) * curN + j]);
+                            simd_load(c_sum_1, &current_C[(i + 1) * curN + j]);
+                            simd_load(c_sum_2, &current_C[(i + 2) * curN + j]);
+                            simd_load(c_sum_3, &current_C[(i + 3) * curN + j]);
+                            for (int k_inner = 0; k_inner < curK; ++k_inner) {
+                                floatv8 b_vec; simd_load(b_vec, &current_B[k_inner * curN + j]);
+                                float a0 = current_A[(i + 0) * curK + k_inner];
+                                float a1 = current_A[(i + 1) * curK + k_inner];
+                                float a2 = current_A[(i + 2) * curK + k_inner];
+                                float a3 = current_A[(i + 3) * curK + k_inner];
+                                floatv8 a0_vec = simd_set_floatv8(a0, a0, a0, a0, a0, a0, a0, a0);
+                                floatv8 a1_vec = simd_set_floatv8(a1, a1, a1, a1, a1, a1, a1, a1);
+                                floatv8 a2_vec = simd_set_floatv8(a2, a2, a2, a2, a2, a2, a2, a2);
+                                floatv8 a3_vec = simd_set_floatv8(a3, a3, a3, a3, a3, a3, a3, a3);
+                                c_sum_0 = simd_vmas(a0_vec, b_vec, c_sum_0);
+                                c_sum_1 = simd_vmas(a1_vec, b_vec, c_sum_1);
+                                c_sum_2 = simd_vmas(a2_vec, b_vec, c_sum_2);
+                                c_sum_3 = simd_vmas(a3_vec, b_vec, c_sum_3);
+                            }
+                            simd_store(c_sum_0, &current_C[(i + 0) * curN + j]);
+                            simd_store(c_sum_1, &current_C[(i + 1) * curN + j]);
+                            simd_store(c_sum_2, &current_C[(i + 2) * curN + j]);
+                            simd_store(c_sum_3, &current_C[(i + 3) * curN + j]);
+                        }
                     }
-                    tilesStarted++;
-                    kBlock += curK_next;
                 }
             }
-
-            // （已由 kSuper 循环完成本子块的全部计算）
 
             // 写回当前子块
             volatile int dma_rply_C = 0;
@@ -312,22 +241,6 @@ void gemm(void* params) {
                 (N - curN) * sizeof(float),
                 &dma_rply_C);
             athread_dma_wait_value(&dma_rply_C, 1);
-        }
-    }
-
-    for (int buf = 0; buf < 2; ++buf) {
-        if (isColLeader) {
-            if (A_stage[buf]) ldm_free(A_stage[buf], aPanelSize * sizeof(float));
-        }
-        else {
-            if (A_compute[buf]) ldm_free(A_compute[buf], aPanelSize * sizeof(float));
-        }
-
-        if (isRowLeader) {
-            if (B_stage[buf]) ldm_free(B_stage[buf], bPanelSize * sizeof(float));
-        }
-        else {
-            if (B_compute[buf]) ldm_free(B_compute[buf], bPanelSize * sizeof(float));
         }
     }
 }

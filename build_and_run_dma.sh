@@ -24,31 +24,29 @@ RESULT_DIR="./results/dma"
 DATE_DIR="$RESULT_DIR/$(date +"%Y%m%d")"
 mkdir -p "$DATE_DIR"
 
-EXEC_FILES=(
-    "gemm_dma.exe"
-)
+# 手动设置矩阵维度
+M=1024
+N=1024
+K=1024
 
-M_DIM=${1:-1024}
-N_DIM=${2:-1024}
-K_DIM=${3:-1024}
+EXEC_FILE="gemm_dma.exe"
 
-echo "=== Submitting jobs ==="
-for EXEC_FILE in "${EXEC_FILES[@]}"; do
-    if [ -x "./$EXEC_FILE" ]; then
-        echo "提交: ./$EXEC_FILE"
-        RUN_TIME=$(date +"%H%M%S")
-        LOG_FILE="$DATE_DIR/$(basename "$EXEC_FILE")_${RUN_TIME}.log"
-        bsub -b -q "$QUEUE" -shared -n 1 -cgsp 64 -share_size 15000 \
-             -o "$LOG_FILE" "./$EXEC_FILE" "$M_DIM" "$N_DIM" "$K_DIM"
-        if [ $? -ne 0 ]; then
-            echo "提交失败: ./$EXEC_FILE（请查看集群返回信息）"
-        else
-            echo "已提交: ./$EXEC_FILE（稍后查看 $LOG_FILE）"
-        fi
+echo "=== Submitting job ==="
+if [ -x "./$EXEC_FILE" ]; then
+    echo "提交: ./$EXEC_FILE"
+    RUN_TIME=$(date +"%H%M%S")
+    LOG_FILE="$DATE_DIR/$(basename "$EXEC_FILE")_${RUN_TIME}.log"
+    echo "  配置: M=$M, N=$N, K=$K"
+    bsub -b -q "$QUEUE" -shared -n 1 -cgsp 64 -share_size 15000 \
+         -o "$LOG_FILE" "./$EXEC_FILE" "$M" "$N" "$K"
+    if [ $? -ne 0 ]; then
+        echo "  提交失败: ./$EXEC_FILE M=$M N=$N K=$K（请查看集群返回信息）"
     else
-        echo "未找到可执行文件: ./$EXEC_FILE"
+        echo "  已提交: ./$EXEC_FILE M=$M N=$N K=$K（稍后查看 $LOG_FILE）"
     fi
-done
+else
+    echo "未找到可执行文件: ./$EXEC_FILE"
+fi
 echo "=== Submission finished ==="
-echo "所有任务已提交完成。日志保存在 $DATE_DIR"
+echo "任务已提交完成。日志保存在 $DATE_DIR"
 
