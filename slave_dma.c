@@ -2,7 +2,7 @@
 #include <simd.h>
 #include <string.h>
 
-#define kTileSize 32  // 每次沿 K 维度处理的列数
+#define kTileSize 64  // 每次沿 K 维度处理的列数
 
 // 每核 C 分块最大尺寸（单位：行/列）
 #define kMaxTileM 64
@@ -85,32 +85,86 @@ void gemm(void* params) {
                 float* const __restrict__ current_A = A_panel;
                 float* const __restrict__ current_B = B_panel;
                 float* const __restrict__ current_C = C_ldm;
-                for (int i = 0; i < curM; i += 4) {
-                    for (int j = 0; j < curN; j += 8) {
+                int aligned_M = (curM / 8) * 8;
+                int aligned_N = (curN / 8) * 8;
+                for (int i = 0; i < aligned_M; i += 8) {
+                    for (int j = 0; j < aligned_N; j += 8) {
                         floatv8 c_sum_0, c_sum_1, c_sum_2, c_sum_3;
+                        floatv8 c_sum_4, c_sum_5, c_sum_6, c_sum_7;
                         simd_load(c_sum_0, &current_C[(i + 0) * curN + j]);
                         simd_load(c_sum_1, &current_C[(i + 1) * curN + j]);
                         simd_load(c_sum_2, &current_C[(i + 2) * curN + j]);
                         simd_load(c_sum_3, &current_C[(i + 3) * curN + j]);
+                        simd_load(c_sum_4, &current_C[(i + 4) * curN + j]);
+                        simd_load(c_sum_5, &current_C[(i + 5) * curN + j]);
+                        simd_load(c_sum_6, &current_C[(i + 6) * curN + j]);
+                        simd_load(c_sum_7, &current_C[(i + 7) * curN + j]);
                         for (int k_inner = 0; k_inner < curK; ++k_inner) {
                             floatv8 b_vec; simd_load(b_vec, &current_B[k_inner * curN + j]);
                             float a0 = current_A[(i + 0) * curK + k_inner];
                             float a1 = current_A[(i + 1) * curK + k_inner];
                             float a2 = current_A[(i + 2) * curK + k_inner];
                             float a3 = current_A[(i + 3) * curK + k_inner];
+                            float a4 = current_A[(i + 4) * curK + k_inner];
+                            float a5 = current_A[(i + 5) * curK + k_inner];
+                            float a6 = current_A[(i + 6) * curK + k_inner];
+                            float a7 = current_A[(i + 7) * curK + k_inner];
                             floatv8 a0_vec = simd_set_floatv8(a0, a0, a0, a0, a0, a0, a0, a0);
                             floatv8 a1_vec = simd_set_floatv8(a1, a1, a1, a1, a1, a1, a1, a1);
                             floatv8 a2_vec = simd_set_floatv8(a2, a2, a2, a2, a2, a2, a2, a2);
                             floatv8 a3_vec = simd_set_floatv8(a3, a3, a3, a3, a3, a3, a3, a3);
+                            floatv8 a4_vec = simd_set_floatv8(a4, a4, a4, a4, a4, a4, a4, a4);
+                            floatv8 a5_vec = simd_set_floatv8(a5, a5, a5, a5, a5, a5, a5, a5);
+                            floatv8 a6_vec = simd_set_floatv8(a6, a6, a6, a6, a6, a6, a6, a6);
+                            floatv8 a7_vec = simd_set_floatv8(a7, a7, a7, a7, a7, a7, a7, a7);
                             c_sum_0 = simd_vmas(a0_vec, b_vec, c_sum_0);
                             c_sum_1 = simd_vmas(a1_vec, b_vec, c_sum_1);
                             c_sum_2 = simd_vmas(a2_vec, b_vec, c_sum_2);
                             c_sum_3 = simd_vmas(a3_vec, b_vec, c_sum_3);
+                            c_sum_4 = simd_vmas(a4_vec, b_vec, c_sum_4);
+                            c_sum_5 = simd_vmas(a5_vec, b_vec, c_sum_5);
+                            c_sum_6 = simd_vmas(a6_vec, b_vec, c_sum_6);
+                            c_sum_7 = simd_vmas(a7_vec, b_vec, c_sum_7);
                         }
                         simd_store(c_sum_0, &current_C[(i + 0) * curN + j]);
                         simd_store(c_sum_1, &current_C[(i + 1) * curN + j]);
                         simd_store(c_sum_2, &current_C[(i + 2) * curN + j]);
                         simd_store(c_sum_3, &current_C[(i + 3) * curN + j]);
+                        simd_store(c_sum_4, &current_C[(i + 4) * curN + j]);
+                        simd_store(c_sum_5, &current_C[(i + 5) * curN + j]);
+                        simd_store(c_sum_6, &current_C[(i + 6) * curN + j]);
+                        simd_store(c_sum_7, &current_C[(i + 7) * curN + j]);
+                    }
+                    for (int j = aligned_N; j < curN; ++j) {
+                        for (int r = 0; r < 8; ++r) {
+                            float acc = current_C[(i + r) * curN + j];
+                            for (int k_inner = 0; k_inner < curK; ++k_inner) {
+                                acc += current_A[(i + r) * curK + k_inner] *
+                                    current_B[k_inner * curN + j];
+                            }
+                            current_C[(i + r) * curN + j] = acc;
+                        }
+                    }
+                }
+                for (int i = aligned_M; i < curM; ++i) {
+                    int j = 0;
+                    for (; j + 7 < curN; j += 8) {
+                        floatv8 c_sum;
+                        simd_load(c_sum, &current_C[i * curN + j]);
+                        for (int k_inner = 0; k_inner < curK; ++k_inner) {
+                            floatv8 b_vec; simd_load(b_vec, &current_B[k_inner * curN + j]);
+                            float a_val = current_A[i * curK + k_inner];
+                            floatv8 a_vec = simd_set_floatv8(a_val, a_val, a_val, a_val, a_val, a_val, a_val, a_val);
+                            c_sum = simd_vmas(a_vec, b_vec, c_sum);
+                        }
+                        simd_store(c_sum, &current_C[i * curN + j]);
+                    }
+                    for (; j < curN; ++j) {
+                        float acc = current_C[i * curN + j];
+                        for (int k_inner = 0; k_inner < curK; ++k_inner) {
+                            acc += current_A[i * curK + k_inner] * current_B[k_inner * curN + j];
+                        }
+                        current_C[i * curN + j] = acc;
                     }
                 }
             }

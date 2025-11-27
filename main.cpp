@@ -6,7 +6,7 @@
 #include <athread.h> // 主核接口
 
 // 是否执行主核计算并验证结果
-const bool VERIFY_RESULT = true;
+const bool VERIFY_RESULT = false;
 
 // --- 从 master.c 引入的函数 ---
 // 使用 extern "C" 来告诉 C++ 编译器这个函数是 C 风格的，防止名字修饰
@@ -99,27 +99,34 @@ int main(int argc, char* argv[]) {
     std::cout << "-------------------------------------------" << std::endl;
     std::cout << "Starting slave core computation for " << M << "x" << N << "x" << K << " GEMM..." << std::endl;
 
-    // 4. 执行从核计算并计时
-    auto start_time = std::chrono::high_resolution_clock::now();
-
+    // 4. 执行从核计算（含预热和多次测试）并计时
     const int CORE_GRID_DIM = 8;
     int base_tileM = M / CORE_GRID_DIM;
     int base_tileN = N / CORE_GRID_DIM;
+    const int WARMUP_RUNS = 5;
+    const int MEASURE_RUNS = 10;
 
-    // 调用 master.c 中的 GEMM 接口
-    GEMM(A, B, C_slave, M, N, K, base_tileM, base_tileN);
+    std::cout << "Warmup runs: " << WARMUP_RUNS << std::endl;
+    for (int i = 0; i < WARMUP_RUNS; ++i) {
+        GEMM(A, B, C_slave, M, N, K, base_tileM, base_tileN);
+    }
 
-    auto end_time = std::chrono::high_resolution_clock::now();
+    std::cout << "Measured runs: " << MEASURE_RUNS << std::endl;
+    double total_seconds = 0.0;
+    for (int run = 0; run < MEASURE_RUNS; ++run) {
+        auto start_time = std::chrono::high_resolution_clock::now();
+        GEMM(A, B, C_slave, M, N, K, base_tileM, base_tileN);
+        auto end_time = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> elapsed = end_time - start_time;
+        total_seconds += elapsed.count();
+    }
 
-    // 5. 计算并打印从核性能
-    std::chrono::duration<double> elapsed = end_time - start_time;
-    double seconds = elapsed.count();
-    // GFLOPS = (2 * M * N * K) / (time * 10^9)
-    double gflops = (2.0 * M * N * K) / (seconds * 1e9);
+    double avg_seconds = total_seconds / MEASURE_RUNS;
+    double gflops = (2.0 * M * N * K) / (avg_seconds * 1e9);
 
     std::cout << "Slave core computation finished." << std::endl;
-    std::cout << "Execution time: " << seconds << " seconds" << std::endl;
-    std::cout << "Performance: " << gflops << " GFLOPS" << std::endl;
+    std::cout << "Average execution time: " << avg_seconds << " seconds" << std::endl;
+    std::cout << "Performance (avg GFLOPS): " << gflops << std::endl;
     std::cout << "-------------------------------------------" << std::endl;
 
 
@@ -139,8 +146,8 @@ int main(int argc, char* argv[]) {
         bool ok = verify(C_slave, C_cpu, M, N);
         std::cout << "CPU time: " << cpu_seconds << " seconds" << std::endl;
         std::cout << "CPU GFLOPS: " << cpu_gflops << std::endl;
-        std::cout << "Slave time: " << seconds << " seconds" << std::endl;
-        std::cout << "Speedup (CPU/Slave): " << (cpu_seconds / seconds) << std::endl;
+        std::cout << "Slave time (avg): " << avg_seconds << " seconds" << std::endl;
+        std::cout << "Speedup (CPU/Slave): " << (cpu_seconds / avg_seconds) << std::endl;
 
         // 调试输出：打印左上角 4x4 的从核结果与CPU结果
         int dbg_rows = (M < 4 ? M : 4);

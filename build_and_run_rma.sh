@@ -24,31 +24,40 @@ RESULT_DIR="./results/rma"
 DATE_DIR="$RESULT_DIR/$(date +"%Y%m%d")"
 mkdir -p "$DATE_DIR"
 
-EXEC_FILES=(
-    "gemm_rma.exe"
+# 需要遍历的矩阵规模（M=N=K）
+SIZES=(
+    1536
+    2048
+    3072
+    4096
+    6144
+    7680
+    8192
+    15360
 )
 
-M_DIM=${1:-2048}
-N_DIM=${2:-2048}
-K_DIM=${3:-2048}
+EXEC_FILE="gemm_rma.exe"
 
 echo "=== Submitting jobs ==="
-for EXEC_FILE in "${EXEC_FILES[@]}"; do
-    if [ -x "./$EXEC_FILE" ]; then
-        echo "提交: ./$EXEC_FILE"
+if [ -x "./$EXEC_FILE" ]; then
+    for SIZE in "${SIZES[@]}"; do
+        M_DIM=$SIZE
+        N_DIM=$SIZE
+        K_DIM=$SIZE
         RUN_TIME=$(date +"%H%M%S")
-        LOG_FILE="$DATE_DIR/$(basename "$EXEC_FILE")_${RUN_TIME}.log"
+        LOG_FILE="$DATE_DIR/$(basename "$EXEC_FILE")_${M_DIM}x${N_DIM}x${K_DIM}_${RUN_TIME}.log"
+        echo "提交: ./$EXEC_FILE  (M=N=K=$SIZE)"
         bsub -b -q "$QUEUE" -shared -n 1 -cgsp 64 -share_size 15000 \
              -o "$LOG_FILE" "./$EXEC_FILE" "$M_DIM" "$N_DIM" "$K_DIM"
         if [ $? -ne 0 ]; then
-            echo "提交失败: ./$EXEC_FILE（请查看集群返回信息）"
+            echo "  提交失败: ./$EXEC_FILE（请查看集群返回信息）"
         else
-            echo "已提交: ./$EXEC_FILE（稍后查看 $LOG_FILE）"
+            echo "  已提交: ./$EXEC_FILE（日志：$LOG_FILE）"
         fi
-    else
-        echo "未找到可执行文件: ./$EXEC_FILE"
-    fi
-done
+    done
+else
+    echo "未找到可执行文件: ./$EXEC_FILE"
+fi
 echo "=== Submission finished ==="
 echo "所有任务已提交完成。日志保存在 $DATE_DIR"
 
